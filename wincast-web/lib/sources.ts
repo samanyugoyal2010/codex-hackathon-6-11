@@ -1,11 +1,23 @@
 // Live market fetchers (run server-side in the API route to avoid CORS).
 // Ports of wincast/sources/polymarket.py and kalshi.py.
+//
+// Key design point: a keyword can match MANY events (e.g. "President" matches
+// "Presidential Election Winner 2028", "Democratic Nominee 2028", novelty
+// "become president before 2045" markets, ...). Blending all of them yields a
+// nonsensical consensus. So each fetcher selects the SINGLE best-matching,
+// coherent event — the most liquid multi-outcome ("who wins") market — and
+// returns only its outcomes. That makes every keyword work, not just World Cup.
 
 import type { SourceRow } from "./types";
 
 const HTTP_TIMEOUT = 12_000;
 const POLY_BASE = "https://gamma-api.polymarket.com";
 const KALSHI_BASE = "https://external-api.kalshi.com/trade-api/v2";
+
+export interface SourceResult {
+  rows: SourceRow[];
+  eventTitle: string | null;
+}
 
 async function getJSON(url: string): Promise<unknown> {
   const ctrl = new AbortController();
@@ -36,13 +48,69 @@ function toNum(v: unknown, d = 0): number {
   return Number.isFinite(n) ? n : d;
 }
 
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** Each keyword token must appear at a WORD START in the title.
+ *  Word-start (not raw substring) avoids "nba" matching "Sheinbaum"; prefix
+ *  (not whole-word) still lets "president" match "Presidential". */
+function titleMatches(title: string, kw: string): boolean {
+  const t = (title ?? "").toLowerCase();
+  const tokens = kw.toLowerCase().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return false;
+  return tokens.every((tok) => new RegExp(`\\b${escapeRe(tok)}`, "i").test(t));
+}
+
+/** Pick the most relevant event: prefer multi-outcome ("who wins") events,
+ *  then the deepest by liquidity. Single-outcome events lose to real winner
+ *  markets, and an empty result loses to anything. */
+function pickBest<T extends { rows: SourceRow[] }>(candidates: T[]): T | null {
+  const usable = candidates.filter((c) => c.rows.length > 0);
+  if (usable.length === 0) return null;
+  usable.sort((a, b) => {
+    const aMulti = a.rows.length >= 2 ? 1 : 0;
+    const bMulti = b.rows.length >= 2 ? 1 : 0;
+    if (aMulti !== bMulti) return bMulti - aMulti;
+    const aVol = a.rows.reduce((s, r) => s + r.volume, 0);
+    const bVol = b.rows.reduce((s, r) => s + r.volume, 0);
+    if (bVol !== aVol) return bVol - aVol;
+    return b.rows.length - a.rows.length;
+  });
+  return usable[0];
+}
+
 // ---------------------------------------------------------------- Polymarket
-export async function fetchPolymarket(keyword: string): Promise<SourceRow[]> {
+function polymarketRows(event: any): SourceRow[] {
+  const rows: SourceRow[] = [];
+  for (const market of event?.markets ?? []) {
+    if (market?.closed) continue;
+    const outcomes = parseStringified(market?.outcomes);
+    const prices = parseStringified(market?.outcomePrices);
+    let prob: number | null = null;
+    for (let i = 0; i < outcomes.length; i++) {
+      if (String(outcomes[i]).trim().toLowerCase() === "yes") {
+        prob = toNum(prices[i], NaN);
+        break;
+      }
+    }
+    if (prob === null && prices.length) prob = toNum(prices[0], NaN);
+    if (prob === null || !Number.isFinite(prob) || prob <= 0 || prob >= 1) continue;
+    const team = market?.groupItemTitle || market?.question || "?";
+    rows.push({
+      team: String(team).trim(),
+      prob,
+      volume: toNum(market?.volumeNum, 0),
+      source: "polymarket",
+    });
+  }
+  return rows;
+}
+
+export async function fetchPolymarket(keyword: string): Promise<SourceResult> {
   const kw = (keyword ?? "").trim().toLowerCase();
-  if (!kw) return [];
+  if (!kw) return { rows: [], eventTitle: null };
   try {
     const events: any[] = [];
-    for (const offset of [0, 100]) {
+    for (const offset of [0, 100, 200]) {
       const page = (await getJSON(
         `${POLY_BASE}/events?closed=false&limit=100&offset=${offset}`,
       )) as any[];
@@ -50,41 +118,20 @@ export async function fetchPolymarket(keyword: string): Promise<SourceRow[]> {
       events.push(...page);
     }
 
-    const out: SourceRow[] = [];
-    for (const event of events) {
-      const title = String(event?.title ?? "").toLowerCase();
-      if (!title.includes(kw)) continue;
-      for (const market of event?.markets ?? []) {
-        if (market?.closed) continue;
-        const outcomes = parseStringified(market?.outcomes);
-        const prices = parseStringified(market?.outcomePrices);
-        let prob: number | null = null;
-        for (let i = 0; i < outcomes.length; i++) {
-          if (String(outcomes[i]).trim().toLowerCase() === "yes") {
-            prob = toNum(prices[i], NaN);
-            break;
-          }
-        }
-        if (prob === null && prices.length) prob = toNum(prices[0], NaN);
-        if (prob === null || !Number.isFinite(prob) || prob <= 0 || prob >= 1) continue;
-        const team = market?.groupItemTitle || market?.question || "?";
-        out.push({
-          team: String(team).trim(),
-          prob,
-          volume: toNum(market?.volumeNum, 0),
-          source: "polymarket",
-        });
-      }
-    }
-    return out;
+    const candidates = events
+      .filter((e) => titleMatches(String(e?.title ?? ""), kw))
+      .map((e) => ({ title: String(e?.title ?? "").trim(), rows: polymarketRows(e) }));
+
+    const best = pickBest(candidates);
+    return best ? { rows: best.rows, eventTitle: best.title } : { rows: [], eventTitle: null };
   } catch {
-    return [];
+    return { rows: [], eventTitle: null };
   }
 }
 
 // -------------------------------------------------------------------- Kalshi
 const KALSHI_MAX_PAGES = 5;
-const KALSHI_MAX_EVENTS = 14; // cap markets calls to avoid rate limits
+const KALSHI_MAX_EVENTS = 16; // cap markets calls to avoid rate limits
 
 async function findKalshiEvents(kw: string): Promise<any[]> {
   const matched: any[] = [];
@@ -96,7 +143,7 @@ async function findKalshiEvents(kw: string): Promise<any[]> {
         (cursor ? `&cursor=${cursor}` : "");
       const data = (await getJSON(url)) as any;
       for (const ev of data?.events ?? []) {
-        if (String(ev?.title ?? "").toLowerCase().includes(kw)) matched.push(ev);
+        if (titleMatches(String(ev?.title ?? ""), kw)) matched.push(ev);
       }
       cursor = data?.cursor;
       if (!cursor) break;
@@ -104,7 +151,6 @@ async function findKalshiEvents(kw: string): Promise<any[]> {
       break; // keep whatever we matched so far
     }
   }
-  // Prefer the deepest / most-liquid events; cap to keep request count sane.
   return matched.slice(0, KALSHI_MAX_EVENTS);
 }
 
@@ -123,16 +169,17 @@ function kalshiProb(m: any): number | null {
   return null;
 }
 
-export async function fetchKalshi(keyword: string): Promise<SourceRow[]> {
+export async function fetchKalshi(keyword: string): Promise<SourceResult> {
   const kw = (keyword ?? "").trim().toLowerCase();
-  if (!kw) return [];
+  if (!kw) return { rows: [], eventTitle: null };
   try {
     const events = await findKalshiEvents(kw);
     // Fetch each event's markets independently — one failure must not drop the rest.
-    const perEvent = await Promise.all(
+    const candidates = await Promise.all(
       events.map(async (event) => {
         const ticker = event?.event_ticker;
-        if (!ticker) return [] as SourceRow[];
+        const title = String(event?.title ?? "").trim();
+        if (!ticker) return { title, rows: [] as SourceRow[] };
         try {
           const data = (await getJSON(
             `${KALSHI_BASE}/markets?event_ticker=${encodeURIComponent(ticker)}&limit=200`,
@@ -149,15 +196,17 @@ export async function fetchKalshi(keyword: string): Promise<SourceRow[]> {
               source: "kalshi",
             });
           }
-          return rows;
+          return { title, rows };
         } catch {
-          return [] as SourceRow[];
+          return { title, rows: [] as SourceRow[] };
         }
       }),
     );
-    return perEvent.flat();
+
+    const best = pickBest(candidates);
+    return best ? { rows: best.rows, eventTitle: best.title } : { rows: [], eventTitle: null };
   } catch {
-    return [];
+    return { rows: [], eventTitle: null };
   }
 }
 

@@ -19,6 +19,22 @@ npm run dev
 Open <http://localhost:3000>. Type any event keyword (World Cup, President, Champions…) or
 click a suggestion; the dashboard auto-refreshes every 15s.
 
+### GPT event analysis
+
+The **GPT event read** panel asks OpenAI (GPT 5.5) to interpret the current market picture
+and call out the key things to notice — **what might go right** (factors that raise the
+contender's win chances), **what might go wrong** (factors that lower them), and concrete
+**signals to watch**. Click *analyze* to run it.
+
+Set your key in `wincast-web/.env.local` (gitignored):
+
+```bash
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-5.5   # optional; defaults to gpt-5.5
+```
+
+Restart `npm run dev` after editing env files.
+
 ## How it works
 
 - **`app/api/markets/route.ts`** — server route. Fetches both venues server-side (avoids CORS),
@@ -28,8 +44,10 @@ click a suggestion; the dashboard auto-refreshes every 15s.
 - **`lib/model.ts`** — de-vig → logarithmic opinion pool (log-liquidity weighted) → edges + uncertainty.
 - **`lib/calibration.ts`** — the trained model's forward pass (StandardScaler + logistic),
   weights exported from `../wincast/wincast_model.joblib`. Corrects favorite–longshot bias.
+- **`lib/insights.ts`** + **`app/api/insights/route.ts`** — GPT analysis. Sends the pooled
+  market picture to OpenAI and returns structured upside / risk / watch points (validated JSON).
 - **`components/Dashboard.tsx`** — the UI: editable headline event, live favorite card,
-  stat stack, edge alerts, and an animated probability table.
+  stat stack, edge alerts, the GPT event-read panel, and an animated probability table.
 
 ## Design
 

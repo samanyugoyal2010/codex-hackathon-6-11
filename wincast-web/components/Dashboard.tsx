@@ -12,9 +12,10 @@ import {
 } from "lucide-react";
 import type { MarketsResponse, ConsensusRow } from "@/lib/types";
 import { pct, signedPct, compactVolume } from "@/lib/format";
+import Insights from "@/components/Insights";
 
 const REFRESH_MS = 15_000;
-const SUGGESTIONS = ["World Cup", "President", "Champions", "Super Bowl", "Fed"];
+const SUGGESTIONS = ["World Cup", "Election", "President", "Nobel"];
 
 export default function Dashboard() {
   const [keyword, setKeyword] = useState("World Cup");
@@ -112,6 +113,24 @@ export default function Dashboard() {
         </div>
       </form>
 
+      {data && (data.events.polymarket || data.events.kalshi) && (
+        <div className="mt-4 flex flex-wrap items-center gap-x-5 gap-y-1.5 text-[11px] text-[var(--ink-faint)]">
+          <span className="eyebrow">matched market</span>
+          {data.events.polymarket && (
+            <span>
+              <span className="text-[var(--ink-dim)]">Polymarket</span> ·{" "}
+              {data.events.polymarket}
+            </span>
+          )}
+          {data.events.kalshi && (
+            <span>
+              <span className="text-[var(--ink-dim)]">Kalshi</span> ·{" "}
+              {data.events.kalshi}
+            </span>
+          )}
+        </div>
+      )}
+
       <Controls
         useMl={useMl}
         setUseMl={setUseMl}
@@ -129,6 +148,15 @@ export default function Dashboard() {
 
       {/* edge alerts */}
       <EdgeStrip alerts={visibleAlerts} fallback={data?.usedFallback} />
+
+      {/* GPT event analysis */}
+      <Insights
+        keyword={data?.keyword ?? keyword}
+        rows={rows}
+        alerts={data?.alerts ?? []}
+        usedFallback={data?.usedFallback}
+        focusTeam={top?.team}
+      />
 
       {/* probability table */}
       <ProbTable rows={rows} probKey={probKey} max={max} useMl={useMl} loading={loading} />

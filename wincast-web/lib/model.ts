@@ -28,6 +28,9 @@ const TEAM_ALIASES: Record<string, string> = {
 export function normalizeTeam(name: string): string {
   let key = (name ?? "").trim().toLowerCase();
   if (key.startsWith("yes ")) key = key.slice(4).trim();
+  // Strip punctuation and collapse whitespace so cross-venue spellings collapse
+  // (e.g. "J.D. Vance" === "JD Vance", "Lula da Silva" === "lula  da silva").
+  key = key.replace(/[.,'’`]/g, "").replace(/\s+/g, " ").trim();
   return TEAM_ALIASES[key] ?? key;
 }
 
