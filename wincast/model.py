@@ -92,47 +92,61 @@ def reliability_weight(volume: float) -> float:
 # Consensus blend
 # --------------------------------------------------------------------------- #
 def consensus(sources: List[List[Dict]], method: str = "logpool") -> pd.DataFrame:
-    """Aggregate per-team win probabilities across sources.
+    """Aggregate per-team win probabilities across an arbitrary set of sources.
+
+    The pool is fully source-agnostic: pass two venues or ten, and each one gets
+    its own `p_<source>` and `edge_<source>` columns. The de-vig, log-opinion
+    pool, and liquidity weighting all scale to however many sources show up.
 
     Args:
         sources: list of source row-lists, each row {team, prob, volume, source}.
         method:  "logpool" (default) or "linear" for the naive volume-weighted mean.
 
     Returns a DataFrame with columns:
-        team, p_poly, p_kalshi, consensus, uncertainty, edge_poly, edge_kalshi, volume
-    Teams present in only one source still appear (other source = NaN).
+        team, p_<src> (one per source), consensus, uncertainty, disagreement,
+        volume, edge_<src> (one per source)
+    Teams present in only one source still appear (missing sources = NaN).
     """
     per_source = {}      # source -> {team: prob}  (de-vigged)
     per_source_vol = {}  # source -> {team: volume}
+    source_order = []    # preserve first-seen order for stable columns
     for rows in sources:
         if not rows:
             continue
         src = rows[0].get("source", "?")
-        raw, vol = {}, {}
+        raw = per_source.setdefault(src, {})
+        vol = per_source_vol.setdefault(src, {})
+        if src not in source_order:
+            source_order.append(src)
         for r in rows:
             team = normalize_team(r["team"])
-            if team not in raw or (r.get("volume", 0) or 0) > vol.get(team, 0):
+            v = r.get("volume", 0) or 0
+            # Keep the deepest market when a source lists a team more than once.
+            if team not in raw or v > vol.get(team, 0):
                 raw[team] = r["prob"]
-                vol[team] = r.get("volume", 0) or 0
-        per_source[src] = devig(raw)
-        per_source_vol[src] = vol
+                vol[team] = v
+    for src in source_order:  # de-vig each source independently
+        per_source[src] = devig(per_source[src])
 
     teams = sorted({t for d in per_source.values() for t in d})
-    cols = ["team", "p_poly", "p_kalshi", "consensus", "uncertainty",
-            "edge_poly", "edge_kalshi", "volume"]
+    cols = (["team"] + ["p_" + s for s in source_order]
+            + ["consensus", "uncertainty", "disagreement", "volume"]
+            + ["edge_" + s for s in source_order])
     if not teams:
         return pd.DataFrame(columns=cols)
 
     records = []
     for team in teams:
-        p_poly = per_source.get("polymarket", {}).get(team)
-        p_kalshi = per_source.get("kalshi", {}).get(team)
-        v_poly = per_source_vol.get("polymarket", {}).get(team, 0)
-        v_kalshi = per_source_vol.get("kalshi", {}).get(team, 0)
-
-        pairs = [(p_poly, reliability_weight(v_poly)),
-                 (p_kalshi, reliability_weight(v_kalshi))]
-        present = [(p, w) for p, w in pairs if p is not None]
+        present = []        # (prob, weight) for sources that price this team
+        total_vol = 0.0
+        rec = {"team": _display_name(team)}
+        for src in source_order:
+            p = per_source[src].get(team)
+            v = per_source_vol[src].get(team, 0) or 0
+            rec["p_" + src] = p
+            if p is not None:
+                present.append((p, reliability_weight(v)))
+                total_vol += v
         if not present:
             continue
 
@@ -144,16 +158,14 @@ def consensus(sources: List[List[Dict]], method: str = "logpool") -> pd.DataFram
             cons = log_pool(present)
 
         probs_only = [p for p, _ in present]
+        # Cross-source disagreement = epistemic uncertainty (a calibration feature).
         uncertainty = float(np.std(probs_only)) if len(probs_only) > 1 else 0.0
 
-        records.append({
-            "team": _display_name(team),
-            "p_poly": p_poly,
-            "p_kalshi": p_kalshi,
-            "consensus": cons,
-            "uncertainty": uncertainty,
-            "volume": (v_poly or 0) + (v_kalshi or 0),
-        })
+        rec["consensus"] = cons
+        rec["uncertainty"] = uncertainty
+        rec["disagreement"] = uncertainty
+        rec["volume"] = total_vol
+        records.append(rec)
 
     df = pd.DataFrame.from_records(records)
     # Re-normalize the consensus across teams so it reads as a clean distribution.
@@ -161,23 +173,32 @@ def consensus(sources: List[List[Dict]], method: str = "logpool") -> pd.DataFram
     if cons_sum > 0:
         df["consensus"] = df["consensus"] / cons_sum
 
-    df["edge_poly"] = df["p_poly"] - df["consensus"]
-    df["edge_kalshi"] = df["p_kalshi"] - df["consensus"]
+    for src in source_order:
+        df["edge_" + src] = df["p_" + src] - df["consensus"]
     df = df.sort_values("consensus", ascending=False).reset_index(drop=True)
     return df[cols]
 
 
-def edge_alerts(df: pd.DataFrame, threshold: float = EDGE_THRESHOLD) -> List[str]:
-    """Human-readable mispricing messages for |edge| above the threshold."""
+def edge_alerts(df: pd.DataFrame, threshold: float = EDGE_THRESHOLD,
+                labels: Optional[Dict[str, str]] = None) -> List[str]:
+    """Human-readable mispricing messages for |edge| above the threshold.
+
+    Scans every `edge_<source>` column, so it covers however many venues are in
+    the pool. `labels` maps a source key to its display name (else Title Case).
+    """
+    labels = labels or {}
+    edge_cols = [c for c in df.columns if c.startswith("edge_")]
     msgs = []
     for _, row in df.iterrows():
-        for src, col in (("Polymarket", "edge_poly"), ("Kalshi", "edge_kalshi")):
+        for col in edge_cols:
             edge = row[col]
             if pd.isna(edge) or abs(edge) <= threshold:
                 continue
+            src = col[len("edge_"):]
+            name = labels.get(src, src.replace("_", " ").title())
             direction = "underpricing" if edge < 0 else "overpricing"
             msgs.append("{} {} {} by {:.1f}%".format(
-                src, direction, row["team"], abs(edge) * 100))
+                name, direction, row["team"], abs(edge) * 100))
     return msgs
 
 
@@ -191,7 +212,11 @@ if __name__ == "__main__":
         {"team": "BRA", "prob": 0.24, "volume": 600_000, "source": "kalshi"},
         {"team": "France", "prob": 0.17, "volume": 400_000, "source": "kalshi"},
     ]
-    df = consensus([poly, kalshi])
+    manifold = [
+        {"team": "Brazil", "prob": 0.22, "volume": 40_000, "source": "manifold"},
+        {"team": "Spain", "prob": 0.16, "volume": 25_000, "source": "manifold"},
+    ]
+    df = consensus([poly, kalshi, manifold])
     print(df.to_string())
     print("consensus sum:", round(df["consensus"].sum(), 4))
     print("alerts:", edge_alerts(df))

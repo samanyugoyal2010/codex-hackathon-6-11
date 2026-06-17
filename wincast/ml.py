@@ -38,19 +38,29 @@ def _logit(p, floor=_EPS):
 def build_features(df: pd.DataFrame) -> np.ndarray:
     """Feature matrix from a consensus-style DataFrame.
 
-    Requires a `consensus` column; uses p_poly/p_kalshi/volume if present.
+    Requires a `consensus` column; uses cross-source disagreement and volume if
+    present. Disagreement is read from an explicit `disagreement` column when the
+    consensus engine supplies one, else derived as the spread (population std)
+    across however many `p_<source>` columns exist — so it works the same whether
+    the pool fused two venues or ten.
+
     The favorite-longshot correction is an odd, S-shaped reshaping of the
     log-odds, so we give the model logit plus its square and cube to let it
     bend the calibration curve.
     """
     cons = df["consensus"].to_numpy(dtype=float)
     lg = _logit(cons, floor=_FEAT_FLOOR)
-    if "p_poly" in df and "p_kalshi" in df:
-        disagree = (df["p_poly"] - df["p_kalshi"]).abs().fillna(0.0).to_numpy()
-    elif "disagreement" in df:
+    if "disagreement" in df:
         disagree = df["disagreement"].fillna(0.0).to_numpy()
     else:
-        disagree = np.zeros_like(cons)
+        # Any per-source probability column except the ground-truth p_true.
+        pcols = [c for c in df.columns if c.startswith("p_") and c != "p_true"]
+        if len(pcols) >= 2:
+            disagree = df[pcols].std(axis=1, ddof=0).fillna(0.0).to_numpy()
+        elif "p_poly" in df and "p_kalshi" in df:
+            disagree = (df["p_poly"] - df["p_kalshi"]).abs().fillna(0.0).to_numpy()
+        else:
+            disagree = np.zeros_like(cons)
     vol = df["volume"].fillna(0.0).to_numpy() if "volume" in df else np.zeros_like(cons)
     log_vol = np.log1p(np.clip(vol, 0, None))
     return np.column_stack([lg, lg ** 2, lg ** 3, disagree, log_vol])

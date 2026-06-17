@@ -31,4 +31,11 @@ TEAM_ALIASES = {
     "por": "portugal",
     "uru": "uruguay",
     "bel": "belgium",
+    # Political names — help PredictIt (full names) match Polymarket/Kalshi.
+    "donald trump": "trump",
+    "joe biden": "biden",
+    "kamala harris": "harris",
+    "gavin newsom": "newsom",
+    "ron desantis": "desantis",
+    "nikki haley": "haley",
 }
